@@ -7,10 +7,17 @@ const number = (value) => Number.isFinite(value) ? value.toLocaleString('en-US')
 const apiBase = (import.meta.env.VITE_API_URL || import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
 async function getData(path, signal) {
   const response = await fetch(`${apiBase}/api/${path}`, { signal })
+  const contentType = response.headers.get('content-type') || ''
   if (!response.ok) {
+    if (!contentType.includes('application/json')) {
+      throw new Error(`API returned HTTP ${response.status}. Please check backend connection.`)
+    }
     const body = await response.json().catch(() => ({}))
     const detail = typeof body.detail === 'string' ? body.detail : Array.isArray(body.detail) ? body.detail.map((item) => `${item.loc.at(-1)}: ${item.msg}`).join('; ') : `HTTP ${response.status}`
     throw new Error(detail)
+  }
+  if (!contentType.includes('application/json')) {
+    throw new Error('Backend API not reachable. Please ensure the backend is running and VITE_API_URL is configured.')
   }
   return response.json()
 }
