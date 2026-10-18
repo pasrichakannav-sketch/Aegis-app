@@ -1,0 +1,21 @@
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+*.bak
+
+# Frontend
+node_modules/
+Frontend/node_modules/
+dist/
+Frontend/dist/
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
