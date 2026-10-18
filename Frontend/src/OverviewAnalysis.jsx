@@ -485,3 +485,286 @@ export function AuditTrailCard({ blocks = [], merkleRoot = '' }) {
     </article>
   )
 }
+
+export function ModelAddsCard({ simulation }) {
+  if (!simulation || !simulation.daily_series?.length) return null
+
+  const daily = simulation.daily_series
+  const last = daily.at(-1) || {}
+  const validation = simulation.validation || {}
+  const baselines = simulation.baselines || []
+  const kpi = simulation.kpis || {}
+
+  // 1. Gap to perfect foresight:
+  // for each of AEGIS, mean forecast, fixed buffer, legacy floors,
+  // compute final (oracle_net_m - strategy_net_m) in $K from the last row of daily_series.
+  // Show as horizontal bars, lowest is best.
+  const oracleNetM = last.oracle_net_m ?? 0
+
+  const strategies = [
+    { key: 'aegis_net_m', name: 'AEGIS', color: '#c7e678' },
+    { key: 'mse_ml_net_m', name: 'Mean forecast', color: '#628fe2' },
+    { key: 'fixed_net_m', name: 'Fixed buffer', color: '#b8a0de' },
+    { key: 'legacy_net_m', name: 'Legacy floors', color: '#c49b62' },
+  ]
+
+  const gaps = strategies.map((s) => {
+    const val = last[s.key]
+    const gapK = Number.isFinite(oracleNetM) && Number.isFinite(val)
+      ? (oracleNetM - val) * 1000
+      : 0
+    return { ...s, gapK }
+  })
+
+  const maxGap = Math.max(...gaps.map((g) => g.gapK), 1)
+  const minGap = Math.min(...gaps.map((g) => g.gapK))
+  const aegisGap = gaps.find((g) => g.key === 'aegis_net_m')?.gapK ?? 0
+
+  // 2. Gap closed:
+  // for each baseline B, show "AEGIS closes X% of the gap left by B" where X = (gapB - gapAEGIS) / gapB * 100.
+  // If AEGIS's gap is larger than B's, show "B is closer to oracle (tuned with hindsight)" instead of a negative percentage.
+  // Do not hide these cases.
+  const baselineGaps = gaps.filter((g) => g.key !== 'aegis_net_m')
+  const gapClosedItems = baselineGaps.map((b) => {
+    if (aegisGap > b.gapK) {
+      return {
+        name: b.name,
+        color: b.color,
+        text: `${b.name} is closer to oracle (tuned with hindsight)`,
+        favorable: false,
+      }
+    }
+    const pct = b.gapK > 0 ? ((b.gapK - aegisGap) / b.gapK) * 100 : 0
+    return {
+      name: b.name,
+      color: b.color,
+      text: `AEGIS closes ${pct.toFixed(1)}% of the gap left by ${b.name}`,
+      favorable: true,
+      pct,
+    }
+  })
+
+  // 3. Monthly win-rate:
+  // take daily_series values at each month end, compute each month's increase in the gap for AEGIS and each baseline,
+  // skipping the first two months (model warm-up).
+  // Show a 10-cell strip per baseline, green where AEGIS's monthly gap increase is smaller,
+  // grey otherwise, with the label "AEGIS better in N of 10 months".
+  const monthEndsMap = new Map()
+  for (const row of daily) {
+    if (row.date) {
+      const monthKey = row.date.slice(0, 7)
+      monthEndsMap.set(monthKey, row)
+    }
+  }
+
+  const monthKeys = Array.from(monthEndsMap.keys()).sort()
+  const monthData = monthKeys.map((mk) => {
+    const row = monthEndsMap.get(mk)
+    const orc = row.oracle_net_m ?? 0
+    return {
+      month: mk,
+      aegisGap: (orc - (row.aegis_net_m ?? 0)) * 1000,
+      mseGap: (orc - (row.mse_ml_net_m ?? 0)) * 1000,
+      fixedGap: (orc - (row.fixed_net_m ?? 0)) * 1000,
+      legacyGap: (orc - (row.legacy_net_m ?? 0)) * 1000,
+    }
+  })
+
+  const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+  const monthlyBaselines = [
+    { key: 'mseGap', name: 'Mean forecast', color: '#628fe2' },
+    { key: 'fixedGap', name: 'Fixed buffer', color: '#b8a0de' },
+    { key: 'legacyGap', name: 'Legacy floors', color: '#c49b62' },
+  ]
+
+  const monthlyWinRates = monthlyBaselines.map((b) => {
+    const cells = []
+    let wins = 0
+    for (let i = 2; i < monthData.length; i++) {
+      const prevAegis = monthData[i - 1].aegisGap
+      const curAegis = monthData[i].aegisGap
+      const incAegis = curAegis - prevAegis
+
+      const prevB = monthData[i - 1][b.key]
+      const curB = monthData[i][b.key]
+      const incB = curB - prevB
+
+      const win = incAegis < incB
+      if (win) wins++
+
+      const d = new Date(monthData[i].month + '-01')
+      const mLabel = !isNaN(d.getTime()) ? monthNames[d.getUTCMonth()] : monthData[i].month.slice(5)
+
+      cells.push({
+        month: mLabel,
+        fullMonth: monthData[i].month,
+        win,
+        incAegis,
+        incB,
+      })
+    }
+    return {
+      name: b.name,
+      color: b.color,
+      wins,
+      total: cells.length,
+      cells,
+    }
+  })
+
+  // 4. Idle cash:
+  // show validation.avg_buffer_m for AEGIS against the fixed buffer in $M
+  // and the percentage difference, plus validation.avg_true_need_m.
+  const fixedBaseline = baselines.find((b) => typeof b.strategy === 'string' && b.strategy.startsWith('Fixed'))
+  const fixedMatch = fixedBaseline?.strategy.match(/Fixed \$?([\d.]+)M/i)
+  const fixedBufferM = fixedMatch ? parseFloat(fixedMatch[1]) : 40.0
+  const aegisAvgBufferM = validation.avg_buffer_m ?? 0
+  const avgTrueNeedM = validation.avg_true_need_m ?? 0
+
+  const idleDiffM = fixedBufferM - aegisAvgBufferM
+  const idlePctDiff = fixedBufferM > 0 ? (idleDiffM / fixedBufferM) * 100 : 0
+
+  return (
+    <section className="panel model-adds-card" aria-label="What the model adds">
+      <div className="section-heading">
+        <div>
+          <p className="eyebrow">INCREMENTAL VALUE</p>
+          <h2>What the model adds</h2>
+          <p>Client-side evaluation against baseline strategies · {kpi.mode === 'strict' ? 'Strict (own funds only)' : 'Overdraft allowed'}</p>
+        </div>
+        <span className="tag">{kpi.mode === 'strict' ? 'Strict liquidity' : 'Overdraft allowed'}</span>
+      </div>
+
+      <div className="model-adds-grid">
+        {/* 1. Gap to perfect foresight (horizontal bars, lowest is best) */}
+        <div className="adds-section gap-bars-section">
+          <div className="section-title-row">
+            <h3>Gap to perfect foresight</h3>
+            <span className="sub-tag">Lowest is best</span>
+          </div>
+          <p className="section-subtext">Cumulative difference from oracle profit at year end (in $K)</p>
+          <div className="gap-bars-list">
+            {gaps.map((item) => {
+              const barWidth = Math.max(8, Math.min(100, (item.gapK / maxGap) * 100))
+              const isBest = Math.abs(item.gapK - minGap) < 0.01
+              return (
+                <div key={item.key} className="gap-bar-row">
+                  <div className="gap-bar-label">
+                    <span className="strategy-name">{item.name}</span>
+                    {isBest && <span className="best-tag">Lowest (Best)</span>}
+                  </div>
+                  <div className="gap-bar-track-wrap">
+                    <div className="gap-bar-track">
+                      <div
+                        className="gap-bar-fill"
+                        style={{
+                          width: `${barWidth}%`,
+                          backgroundColor: item.color,
+                        }}
+                      />
+                    </div>
+                    <span className="gap-bar-value">${item.gapK.toFixed(1)}K</span>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+
+        {/* 2. Gap closed */}
+        <div className="adds-section gap-closed-section">
+          <div className="section-title-row">
+            <h3>Gap closed</h3>
+            <span className="sub-tag">Oracle recovery</span>
+          </div>
+          <p className="section-subtext">Shortfall recovered by AEGIS quantile calibration</p>
+          <div className="gap-closed-list">
+            {gapClosedItems.map((item) => (
+              <div
+                key={item.name}
+                className={`gap-closed-card ${item.favorable ? 'favorable' : 'hindsight'}`}
+              >
+                <span
+                  className="closed-indicator"
+                  style={{ backgroundColor: item.favorable ? '#c7e678' : '#e09843' }}
+                />
+                <span className="closed-text">{item.text}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* 3. Monthly win-rate */}
+        <div className="adds-section winrate-section">
+          <div className="section-title-row">
+            <h3>Monthly win-rate</h3>
+            <span className="sub-tag">Mar–Dec evaluation</span>
+          </div>
+          <p className="section-subtext">Months where AEGIS gap increase was smaller (skipping Jan–Feb warmup)</p>
+          <div className="winrate-list">
+            {monthlyWinRates.map((bw) => (
+              <div key={bw.name} className="winrate-row">
+                <div className="winrate-header">
+                  <span className="bw-name">vs {bw.name}</span>
+                  <span className="bw-score">AEGIS better in {bw.wins} of {bw.total} months</span>
+                </div>
+                <div className="strip-cells" role="group" aria-label={`Monthly performance vs ${bw.name}`}>
+                  {bw.cells.map((cell) => (
+                    <div
+                      key={cell.fullMonth}
+                      className={`strip-cell ${cell.win ? 'win' : 'loss'}`}
+                      title={`${cell.month}: AEGIS +$${cell.incAegis.toFixed(1)}K vs ${bw.name} +$${cell.incB.toFixed(1)}K (${cell.win ? 'AEGIS won month' : 'AEGIS trailed'})`}
+                    >
+                      <span className="cell-month-label">{cell.month}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* 4. Idle cash */}
+        <div className="adds-section idle-cash-section">
+          <div className="section-title-row">
+            <h3>Idle cash efficiency</h3>
+            <span className="sub-tag">Buffer retention</span>
+          </div>
+          <p className="section-subtext">Average buffer retained vs static fixed buffer and true need</p>
+          <div className="idle-cash-metrics">
+            <div className="idle-metric-card">
+              <span className="idle-label">AEGIS Average Buffer</span>
+              <strong className="idle-val">${aegisAvgBufferM.toFixed(1)}M</strong>
+              <small className="idle-sub">dynamic quantile</small>
+            </div>
+            <div className="idle-metric-card">
+              <span className="idle-label">Fixed Buffer</span>
+              <strong className="idle-val">${fixedBufferM.toFixed(1)}M</strong>
+              <small className="idle-sub">static baseline</small>
+            </div>
+            <div className="idle-metric-card highlight">
+              <span className="idle-label">Buffer Reduction</span>
+              <strong className="idle-val positive">
+                {idlePctDiff >= 0 ? '-' : '+'}{Math.abs(idlePctDiff).toFixed(1)}%
+              </strong>
+              <small className="idle-sub">
+                {idleDiffM >= 0
+                  ? `$${idleDiffM.toFixed(1)}M less idle cash`
+                  : `$${Math.abs(idleDiffM).toFixed(1)}M additional buffer`}
+              </small>
+            </div>
+            <div className="idle-metric-card">
+              <span className="idle-label">Average True Need</span>
+              <strong className="idle-val">${avgTrueNeedM.toFixed(1)}M</strong>
+              <small className="idle-sub">actual overnight deficit</small>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <p className="model-adds-footnote">
+        Fixed and legacy baselines were tuned with hindsight on this same year; AEGIS uses none. Differences are small relative to total profit, so the model&apos;s main value is coverage and safety.
+      </p>
+    </section>
+  )
+}
